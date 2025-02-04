@@ -1,8 +1,8 @@
 package databases
 
 import (
+	"eventdrivensystem/configs"
 	"fmt"
-	"loanservice/configs"
 	"time"
 
 	"github.com/labstack/gommon/log"

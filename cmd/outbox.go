@@ -2,11 +2,11 @@ package cmd
 
 import (
 	"context"
+	"eventdrivensystem/configs"
+	models "eventdrivensystem/internal/models/outbox"
+	"eventdrivensystem/pkg/logger"
+	"eventdrivensystem/pkg/util"
 	"fmt"
-	"loanservice/configs"
-	"loanservice/internal/models"
-	"loanservice/pkg/databases"
-	"loanservice/pkg/util"
 	"log"
 	"math/rand"
 	"os"
@@ -53,7 +53,23 @@ type OutboxWorker struct {
 	db         *gorm.DB
 	cfg        *configs.AppConfig
 	queue      *asynq.Client
-	workerPool chan struct{}
+	workerPool chan bool
+	lg         logger.Logger
+}
+
+// NewOutBoxWorker initializes and returns the OutboxWorker
+func NewOutBoxWorker() *OutboxWorker {
+	dp := GetAppDependency()
+	// Initialize the worker pool with a defined concurrency limit
+	workerPool := make(chan bool, dp.cfg.Outbox.MaxConcurrency) // Limit concurrency to 10 workers
+
+	return &OutboxWorker{
+		db:         dp.db,
+		cfg:        dp.cfg,
+		queue:      dp.queue,
+		workerPool: workerPool,
+		lg:         dp.log,
+	}
 }
 
 // ProcessOutboxJobs processes jobs with limited concurrency
@@ -61,21 +77,22 @@ func (o *OutboxWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down outbox worker...")
+			o.lg.InfoWithContext(ctx, "Shutting down outbox worker...")
+			close(o.workerPool)
 			return
 		default:
-			o.processOutboxJobs(wg)
+			o.processOutboxJobs(ctx, wg)
 		}
 	}
 }
 
-func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
+func (o *OutboxWorker) processOutboxJobs(ctx context.Context, wg *sync.WaitGroup) error {
 	tx := o.db.Begin()
 
 	delayNextIteration := time.Duration(rand.Intn(o.cfg.Outbox.DurationIntervalInMs)) * time.Millisecond
 
 	if tx.Error != nil {
-		log.Printf("Error starting transaction: %v", tx.Error)
+		o.lg.ErrorWithContext(ctx, "Error starting transaction: %v", tx.Error)
 		time.Sleep(delayNextIteration)
 		return tx.Error
 	}
@@ -83,7 +100,7 @@ func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
 	// Fetch 100 messages to process using raw SQL
 	var outboxes []models.Outbox
 	err := tx.Raw(`
-			SELECT id, status, attempt, execute_at
+			SELECT id, status, attempt, execute_at, destination_type, event_type, payload
 			FROM outbox
 			WHERE status IN (?, ?) AND execute_at <= ?
 			ORDER BY execute_at asc
@@ -93,27 +110,27 @@ func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
 
 	if err != nil {
 		tx.Rollback()
-		log.Printf("Error fetching data from outbox: %v", err)
+		o.lg.ErrorWithContext(ctx, "Error fetching data from outbox: %v", err)
 		time.Sleep(delayNextIteration)
 		return err
 	}
 
 	if len(outboxes) == 0 {
-		log.Printf("No outboxes to process")
+		o.lg.InfoWithContext(ctx, "No outboxes to process")
 		tx.Rollback()
 		// Sleep for the jitter time
-		fmt.Printf("Sleeping for %v...\n", delayNextIteration)
+		o.lg.InfoWithContext(ctx, "Sleeping for %v...\n", delayNextIteration)
 		time.Sleep(delayNextIteration)
 		return nil
 	}
 
-	log.Printf("Found %d outboxes to process", len(outboxes))
+	o.lg.InfoWithContext(ctx, "Found %d outboxes to process", len(outboxes))
 
 	// Update all selected outboxes to PROCESSING status in the same transaction
-	err = o.setStatusProcessing(tx, outboxes)
+	err = o.setStatusProcessing(ctx, tx, outboxes)
 	if err != nil {
 		tx.Rollback()
-		log.Printf("Error updating outboxes to PROCESSING: %v", err)
+		o.lg.ErrorWithContext(ctx, "Error updating outboxes to PROCESSING: %v", err)
 		time.Sleep(10 * time.Second)
 		return err
 	}
@@ -121,7 +138,7 @@ func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
 	// Commit the transaction before processing
 	err = tx.Commit().Error
 	if err != nil {
-		log.Printf("Error committing transaction: %v", err)
+		o.lg.ErrorWithContext(ctx, "Error committing transaction: %v", err)
 		time.Sleep(delayNextIteration)
 		return err
 	}
@@ -129,11 +146,11 @@ func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
 	// Process the outboxes concurrently with a worker pool
 	for _, outbox := range outboxes {
 		wg.Add(1)
-		o.workerPool <- struct{}{} // Acquire a worker slot
+		o.workerPool <- true // Acquire a worker slot
 		go func(outbox models.Outbox) {
 			defer func() {
-				<-o.workerPool
 				wg.Done()
+				<-o.workerPool
 			}() // Release worker slot after processing
 
 			bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -143,7 +160,7 @@ func (o *OutboxWorker) processOutboxJobs(wg *sync.WaitGroup) error {
 		}(outbox)
 	}
 
-	fmt.Printf("Sleeping for %v...\n", delayNextIteration)
+	o.lg.InfoWithContext(ctx, "Sleeping for %v...\n", delayNextIteration)
 	time.Sleep(delayNextIteration)
 
 	return nil
@@ -155,24 +172,24 @@ func (o *OutboxWorker) processMessage(ctx context.Context, outbox models.Outbox)
 
 	tx := o.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
-		log.Printf("Error starting transaction: %v", tx.Error)
+		o.lg.ErrorWithContext(ctx, "Error starting transaction: %v", tx.Error)
 		return
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
-			log.Printf("Error processing message %s: %v", outbox.ID, r)
+			o.lg.ErrorWithContext(ctx, "Error processing message %s: %v", outbox.ID, r)
 			return
 		}
 		if err != nil {
 			tx.Rollback()
-			log.Printf("Error processing message %s: %v", outbox.ID, err)
+			o.lg.ErrorWithContext(ctx, "Error processing message %s: %v", outbox.ID, err)
 			return
 		}
 		err = tx.Commit().Error
 		if err != nil {
-			log.Printf("Error committing transaction: %v", err)
+			o.lg.ErrorWithContext(ctx, "Error committing transaction: %v", err)
 		}
 	}()
 	// Simulate message processing, can be replaced with actual processing logic (e.g., sending to a queue)
@@ -183,19 +200,21 @@ func (o *OutboxWorker) processMessage(ctx context.Context, outbox models.Outbox)
 		outbox.ErrorMessage = util.ToPointer(errProcess.Error())
 		// If processing fails, update status to RETRYING
 		if outbox.Attempt >= int64(o.cfg.Outbox.MaxRetries) {
-			outbox.Status = models.OutboxStatusFailed
 			// If max retries are reached, update status to FAILED
+			o.lg.ErrorWithContext(ctx, "Reached max retries for processing message %s: %v", outbox.ID, errProcess)
+			outbox.Status = models.OutboxStatusFailed
+
 			err = tx.Updates(outbox).Error
 			if err != nil {
-				log.Printf("Error updating status for message %s: %v", outbox.ID, err)
+				o.lg.ErrorWithContext(ctx, "Error updating status for message %s: %v", outbox.ID, err)
 				return
 			}
 			return
 		}
 		// Compute the next retry time using Exponential Backoff
 		expBackoff := backoff.NewExponentialBackOff()
-		expBackoff.InitialInterval = 5 * time.Minute // Start with 1 min delay
-		expBackoff.MaxInterval = 10 * time.Minute    // Max delay between retries
+		expBackoff.InitialInterval = 1 * time.Minute // Start with 1 min delay
+		expBackoff.MaxInterval = 3 * time.Minute     // Max delay between retries
 		expBackoff.MaxElapsedTime = 1 * time.Hour    // Stop retrying after 1 hour
 		expBackoff.Multiplier = 2.0                  // Exponential growth
 		expBackoff.RandomizationFactor = 0.5         // Add jitter to prevent sync issues
@@ -213,7 +232,7 @@ func (o *OutboxWorker) processMessage(ctx context.Context, outbox models.Outbox)
 		err = tx.Updates(outbox).Error
 
 		if err != nil {
-			log.Printf("Error updating status for message %s: %v", outbox.ID, err)
+			o.lg.ErrorWithContext(ctx, "Error updating status for message %s: %v", outbox.ID, err)
 		}
 		return
 	}
@@ -223,23 +242,29 @@ func (o *OutboxWorker) processMessage(ctx context.Context, outbox models.Outbox)
 	outbox.SentAt = &finishedProcessTime
 	err = tx.Updates(outbox).Error
 	if err != nil {
-		log.Printf("Error updating status for message %s: %v", outbox.ID, err)
+		o.lg.ErrorWithContext(ctx, "Error updating status for message %s: %v", outbox.ID, err)
 		return
 	}
 
 }
 
-// process simulates message processing, replace this with your actual processing logic
+// process processes the message based on the destination type
 func (o *OutboxWorker) process(ctx context.Context, outbox models.Outbox) error {
-	// Create a random number to simulate processing logic
-	randomNumber := rand.Intn(10) + 1 // Generate a number between 1 and 10
-	if randomNumber == 1 {
-		return fmt.Errorf("random processing error")
+
+	switch outbox.DestinationType {
+	case models.OutboxDestinationTypeAsynq:
+		_, err := o.queue.EnqueueContext(ctx, asynq.NewTask(outbox.EventType, outbox.Payload.Bytes), asynq.MaxRetry(o.cfg.AsyncQ.MaxRetries))
+		return err
+	case models.OutboxDestinationTypeKafka:
+		return nil
+	case models.OutboxDestinationTypeRabbitmq:
+		return nil
+	default:
+		return fmt.Errorf("unsupported destination type: %s", outbox.DestinationType)
 	}
-	return nil
 }
 
-func (o *OutboxWorker) setStatusProcessing(tx *gorm.DB, outboxes []models.Outbox) error {
+func (o *OutboxWorker) setStatusProcessing(ctx context.Context, tx *gorm.DB, outboxes []models.Outbox) error {
 	outboxIds := make([]strfmt.UUID4, len(outboxes))
 	for i, outbox := range outboxes {
 		outboxIds[i] = outbox.ID
@@ -249,29 +274,8 @@ func (o *OutboxWorker) setStatusProcessing(tx *gorm.DB, outboxes []models.Outbox
 	err := tx.Exec(qUpdate, models.OutboxStatusProcessing, outboxIds).Error
 
 	if err != nil {
-		log.Printf("error set status processing for outbox_ids: %v err: %v", outboxIds, err)
+		o.lg.ErrorWithContext(ctx, "error set status processing for outbox_ids: %v err: %v", outboxIds, err)
 		return err
 	}
 	return nil
-}
-
-// NewOutBoxWorker initializes and returns the OutboxWorker
-func NewOutBoxWorker() *OutboxWorker {
-	cfg := configs.Get()
-	db, err := databases.NewSqlDb(cfg)
-	if err != nil {
-		log.Fatalf("failed to connect to database: %v", err)
-	}
-
-	asynqClient := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.Redis.Address})
-
-	// Initialize the worker pool with a defined concurrency limit
-	workerPool := make(chan struct{}, cfg.Outbox.MaxConcurrency) // Limit concurrency to 10 workers
-
-	return &OutboxWorker{
-		db:         db,
-		cfg:        cfg,
-		queue:      asynqClient,
-		workerPool: workerPool,
-	}
 }

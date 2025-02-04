@@ -14,25 +14,29 @@ var (
 )
 
 type AppConfig struct {
+	Meta      Meta
 	ApiServer ApiServer
 	SQL       SQL
 	Redis     Redis
 	Outbox    Outbox
+	AsyncQ    AsyncQ
 }
 
-// API Server configuration
-type ApiServer struct {
+type Meta struct {
 	Name string
-	Host string
-	Port int
+}
+
+type ApiServer struct {
+	Host string `validate:"required"`
+	Port int    `validate:"required"`
 }
 
 type SQL struct {
-	DSN string
+	DSN string `validate:"required"`
 }
 
 type Redis struct {
-	Address string
+	Address string `validate:"required"`
 }
 
 type Outbox struct {
@@ -42,17 +46,27 @@ type Outbox struct {
 	DurationIntervalInMs int
 }
 
+type AsyncQ struct {
+	MaxRetries              int
+	BasedServiceConsumerURL string `validate:"required"`
+	MonitoringHost          string `validate:"required"`
+	MonitoringPort          int    `validate:"required"`
+}
+
 func Get() *AppConfig {
+
+	if cfg == nil {
+		Load()
+	}
+
 	return cfg
 }
 
 func Load() {
 	onceCfg.Do(func() {
 		v := viper.New()
-		v.AutomaticEnv()
-
 		v.AddConfigPath(".")
-		v.SetConfigType("json")
+		v.SetConfigType("yaml")
 		v.SetConfigName("config")
 
 		err := v.ReadInConfig()
@@ -60,25 +74,7 @@ func Load() {
 			log.Fatalf("error reading config file, %v", err)
 		}
 
-		c := &AppConfig{
-			ApiServer: ApiServer{
-				Name: v.GetString("api_server.name"),
-				Host: v.GetString("api_server.host"),
-				Port: v.GetInt("api_server.port"),
-			},
-			SQL: SQL{
-				DSN: v.GetString("sql.dsn"),
-			},
-			Redis: Redis{
-				Address: v.GetString("redis.address"),
-			},
-			Outbox: Outbox{
-				MaxRetries:           v.GetInt("outbox.max_retries"),
-				MaxConcurrency:       v.GetInt("outbox.max_concurrency"),
-				MaxBatchSize:         v.GetInt("outbox.max_batch_size"),
-				DurationIntervalInMs: v.GetInt("outbox.duration_interval_in_ms"),
-			},
-		}
+		c := &AppConfig{}
 		err = v.Unmarshal(&c)
 		if err != nil {
 			log.Fatalf("unable to decode into struct, %v", err)

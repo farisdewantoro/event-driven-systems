@@ -1,0 +1,62 @@
+swagger: "2.0"
+info:
+  title: User paths
+  version: 0.0.1
+paths:
+  /v1/users:
+    post:
+      tags:
+        - users
+      summary: Create a new user
+      description: Create a new user
+      produces:
+        - application/json
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/CreateUserRequest"
+      responses:
+        '200':
+          description: User created
+          schema:
+            $ref: "#/definitions/PlainResponse"
+        '400':
+          description: Invalid user payload
+          schema:
+            $ref: "#/definitions/ErrorAPIResponse"
+        '500':
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/ErrorAPIResponse"
+
+
+definitions:
+  CreateUserRequest:
+    type: object
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+  ErrorAPIResponse:
+    type: object
+    properties:
+      message:
+        type: string
+      err_code:
+        type: string
+  PlainResponse:
+    title: Plain Response
+    type: object
+    properties:
+      success:
+        example: true
+        type: boolean
+        x-nullable: false
+      message:
+        example: A success message
+        type: string
+    required:
+      - success

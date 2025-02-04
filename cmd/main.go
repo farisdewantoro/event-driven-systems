@@ -1,16 +1,16 @@
 package cmd
 
 import (
+	"eventdrivensystem/configs"
 	"fmt"
-	"loanservice/configs"
 	"log"
 
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "loan-service",
-	Short: "loan-service is a service to manage loans",
+	Use:   "event-driven system",
+	Short: "event-driven system",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("Hello, World!")
 	},
@@ -21,6 +21,7 @@ func init() {
 	rootCmd.AddCommand(apiServerCmd)
 	rootCmd.AddCommand(migrateUpCmd)
 	rootCmd.AddCommand(outboxWorkerCmd)
+	rootCmd.AddCommand(asynqWorkerCmd)
 }
 
 func Execute() {

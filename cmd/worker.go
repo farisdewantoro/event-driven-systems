@@ -1,56 +1,82 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"eventdrivensystem/internal/handler/worker"
+	"eventdrivensystem/pkg/logger/middleware"
 	"fmt"
-	"loanservice/configs"
-	"log"
 	"net/http"
+	"os"
+	"os/signal"
 
 	"github.com/hibiken/asynq"
+	"github.com/hibiken/asynqmon"
+	"github.com/labstack/echo/v4"
+	echoMiddleware "github.com/labstack/echo/v4/middleware"
 	_ "github.com/lib/pq"
+	"github.com/spf13/cobra"
 )
 
-// Worker processes the Asynq task by calling `/send-email`
-func HandleEmailVerificationTask(ctx context.Context, t *asynq.Task) error {
-	var payload map[string]string
-	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
-		return err
-	}
-
-	// Call API to send email
-	apiURL := "http://localhost:8080/send-email"
-	reqBody, _ := json.Marshal(payload)
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return fmt.Errorf("failed to call send-email API: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("send-email API returned status: %d", resp.StatusCode)
-	}
-
-	log.Printf("Email verification request sent for UserID: %s", payload["user_id"])
-	return nil
+var asynqWorkerCmd = &cobra.Command{
+	Use:   "asynq-worker",
+	Short: "Start the worker service",
+	Run: func(cmd *cobra.Command, args []string) {
+		go StartWorkerService()
+		StartWorker()
+	},
 }
 
-func NewWorker() {
-	cfg := configs.Get()
+func StartWorkerService() {
+	var srv http.Server
+
+	dp := GetAppDependency()
+
+	idleConnection := make(chan struct{})
+	go func() {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, os.Interrupt)
+		<-sigint
+
+		dp.log.Info("[WORKER-API] is shutting down")
+		if err := srv.Shutdown(context.Background()); err != nil {
+			dp.log.Info("[WORKER-API] Fail shutting down:", err)
+		}
+		close(idleConnection)
+	}()
+
+	e := echo.New()
+	e.Use(echoMiddleware.Recover())
+	asynqMon := asynqmon.New(asynqmon.Options{
+		RootPath:     "/monitoring/tasks",
+		RedisConnOpt: asynq.RedisClientOpt{Addr: dp.cfg.Redis.Address},
+	})
+
+	e.Any("/monitoring/tasks/*", echo.WrapHandler(asynqMon))
+
+	go func() {
+		address := fmt.Sprintf("%s:%d", dp.cfg.AsyncQ.MonitoringHost, dp.cfg.AsyncQ.MonitoringPort)
+		if err := e.Start(address); err != nil {
+			dp.log.Info("shutting down the worker server -> ", err)
+		}
+	}()
+}
+
+func StartWorker() {
+	dp := GetAppDependency()
 
 	// Asynq Worker Setup
 	server := asynq.NewServer(
-		asynq.RedisClientOpt{Addr: cfg.Redis.Address},
-		asynq.Config{Concurrency: 5},
+		asynq.RedisClientOpt{Addr: dp.cfg.Redis.Address},
+		asynq.Config{Concurrency: 0},
 	)
 
 	mux := asynq.NewServeMux()
-	mux.HandleFunc("email:verify", HandleEmailVerificationTask)
+	mux.Use(middleware.LoggingMiddlewareAsynq(dp.log))
+	worker.NewWorkerHandler(dp.cfg, dp.log, mux).RegisterHandlers()
 
-	log.Println("Worker started, waiting for tasks...")
+	dp.log.Info("Worker started, waiting for tasks...")
 	if err := server.Run(mux); err != nil {
-		log.Fatalf("Could not start worker: %v", err)
+		dp.log.Error("Could not start worker: %v", err)
+		return
 	}
 }

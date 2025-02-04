@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"errors"
-	"loanservice/configs"
-	"loanservice/pkg/databases"
+	"eventdrivensystem/configs"
+	"eventdrivensystem/pkg/databases"
 	"log"
 
 	"github.com/golang-migrate/migrate/v4"

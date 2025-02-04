@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"eventdrivensystem/internal/domain"
+	"eventdrivensystem/internal/handler/rest"
+	"eventdrivensystem/internal/usecase"
 	"fmt"
-	"loanservice/configs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,11 +29,15 @@ func NewServer() {
 	ctx := context.Background()
 	e := echo.New()
 	e.Use(echoMiddleware.Recover())
+	dp := GetAppDependency()
 
-	cfg := configs.Get()
+	dom := domain.NewDomain(dp.cfg, dp.db, dp.log)
+	uc := usecase.NewUsecase(dp.cfg, dp.log, dom)
+
+	rest.NewRouterHandler(e, dp.validator, uc).RegisterRoutes()
 
 	go func() {
-		address := fmt.Sprintf("%s:%d", cfg.ApiServer.Host, cfg.ApiServer.Port)
+		address := fmt.Sprintf("%s:%d", dp.cfg.ApiServer.Host, dp.cfg.ApiServer.Port)
 		if err := e.Start(address); err != nil {
 			log.Info("shutting down the server -> ", err)
 		}

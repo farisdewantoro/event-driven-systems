@@ -1,7 +1,7 @@
 swagger: "2.0"
 info:
-  description: Loan Service API documentation
-  title: Loan Service API
+  description: Event Driven System API documentation
+  title: Event Driven System
   version: 0.0.4
 basePath: /api
 paths: {}

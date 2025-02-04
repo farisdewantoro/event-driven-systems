@@ -1,6 +1,6 @@
 package main
 
-import "loanservice/cmd"
+import "eventdrivensystem/cmd"
 
 func main() {
 	cmd.Execute()
