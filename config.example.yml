@@ -1,0 +1,19 @@
+Meta:
+  Name: EventDrivenSystem
+ApiServer:
+  Host: localhost
+  Port: 5001
+SQL:
+  DSN: postgres://postgres:postgres@localhost:5432/eventdriven-example?sslmode=disable
+Redis:
+  Address: localhost:6379
+Outbox:
+  MaxRetries: 3
+  MaxConcurrency: 300
+  MaxBatchSize: 3000
+  DurationIntervalInMs: 5000
+AsyncQ:
+  MaxRetries: 3
+  BasedServiceConsumerURL: http://localhost:8080
+  MonitoringHost: localhost 
+  MonitoringPort: 8081
